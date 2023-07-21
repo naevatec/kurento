@@ -29,6 +29,9 @@
 #include <MediaSet.hpp>
 #include <MediaElementImpl.hpp>
 #include <ConnectionState.hpp>
+#include <DtlsConnectionState.hpp>
+#include <DtlsConnectionStateChange.hpp>
+#include <IceComponentState.hpp>
 
 #define NUMBER_OF_RECONNECTIONS 5
 
@@ -50,14 +53,14 @@ struct GF {
   ~GF();
 };
 
-BOOST_GLOBAL_FIXTURE (GF)
+BOOST_GLOBAL_FIXTURE (GF);
 
 GF::GF()
 {
   boost::property_tree::ptree ac, audioCodecs, vc, videoCodecs;
   gst_init (NULL, NULL);
 
-  moduleManager.loadModulesFromDirectories ("../../src/server");
+  moduleManager.loadModulesFromDirectories ("../../src/server:../../..");
 
   config.add ("configPath", "../../../tests" );
   config.add ("modules.kurento.SdpEndpoint.numAudioMedias", 1);
@@ -182,7 +185,6 @@ ice_state_changes (bool useIpv6)
   std::condition_variable cv;
   std::mutex mtx;
   std::unique_lock<std::mutex> lck (mtx);
-  bool active = true;
 
   std::shared_ptr <WebRtcEndpointImpl> webRtcEpOfferer = createWebrtc();
   std::shared_ptr <WebRtcEndpointImpl> webRtcEpAnswerer = createWebrtc();
@@ -216,7 +218,6 @@ ice_state_changes (bool useIpv6)
   }) ) {
     BOOST_ERROR ("Timeout waiting for ICE state change");
   }
-  active = false;
 
   if (!ice_state_changed) {
     BOOST_ERROR ("ICE state not chagned");
@@ -224,6 +225,88 @@ ice_state_changes (bool useIpv6)
 
   releaseWebRtc (webRtcEpOfferer);
   releaseWebRtc (webRtcEpAnswerer);
+}
+
+static  void
+dtls_connection_state_changes (bool useIpv6)
+{
+  DtlsConnectionState offerer_dtls_connection_state = DtlsConnectionState::NEW;
+  DtlsConnectionState answerer_dtls_connection_state = DtlsConnectionState::NEW;
+  std::condition_variable cv;
+  std::mutex mtx;
+  std::unique_lock<std::mutex> lck (mtx);
+
+  std::shared_ptr <WebRtcEndpointImpl> webRtcEpOfferer = createWebrtc();
+  std::shared_ptr <WebRtcEndpointImpl> webRtcEpAnswerer = createWebrtc();
+
+  webRtcEpOfferer->setName ("offerer");
+  webRtcEpAnswerer->setName ("answerer");
+
+  webRtcEpOfferer->signalIceCandidateFound.connect ([&] (IceCandidateFound event) {
+    exchange_candidate (event, webRtcEpAnswerer, useIpv6);
+  });
+
+  webRtcEpAnswerer->signalIceCandidateFound.connect ([&] (IceCandidateFound event) {
+    exchange_candidate (event, webRtcEpOfferer, useIpv6);
+  });
+
+//  webRtcEpOfferer->signalOnIceComponentStateChanged.connect ([&] (
+//  OnIceComponentStateChanged event) {
+//    ice_state_changed = true;
+//    cv.notify_one();
+//  });
+
+  webRtcEpOfferer->signalDtlsConnectionStateChange.connect ([&] (
+    DtlsConnectionStateChange event) {
+      offerer_dtls_connection_state = *(event.getState());
+      BOOST_TEST_MESSAGE("Offerer DTLS connection state: " + offerer_dtls_connection_state.getString() + " component: " + event.getComponentId() + " stream " + event.getStreamId());
+      if ((offerer_dtls_connection_state.getValue() == DtlsConnectionState::CONNECTED) && (answerer_dtls_connection_state.getValue() == DtlsConnectionState::CONNECTED)) {
+        cv.notify_one();
+      }
+    });
+
+
+  webRtcEpAnswerer->signalDtlsConnectionStateChange.connect ([&] (
+    DtlsConnectionStateChange event) {
+      answerer_dtls_connection_state = *(event.getState());
+      BOOST_TEST_MESSAGE("Answerer DTLS connection state: " + answerer_dtls_connection_state.getString() + " component: " + event.getComponentId() + " stream " + event.getStreamId());
+      if ((offerer_dtls_connection_state.getValue() == DtlsConnectionState::CONNECTED) && (answerer_dtls_connection_state.getValue() == DtlsConnectionState::CONNECTED)) {
+        cv.notify_one();
+      }
+    });
+
+
+  std::string offer = webRtcEpOfferer->generateOffer ();
+  std::string answer = webRtcEpAnswerer->processOffer (offer);
+  webRtcEpOfferer->processAnswer (answer);
+
+  webRtcEpOfferer->gatherCandidates ();
+  webRtcEpAnswerer->gatherCandidates ();
+
+  if (!cv.wait_for (lck, std::chrono::seconds (TIMEOUT), [&] () {
+    return ((offerer_dtls_connection_state.getValue() == DtlsConnectionState::CONNECTED) && (answerer_dtls_connection_state.getValue() == DtlsConnectionState::CONNECTED));
+  }) ) {
+    BOOST_ERROR ("Timeout waiting for ICE state change");
+  }
+
+  if ((answerer_dtls_connection_state.getValue() != DtlsConnectionState::CONNECTED) || (offerer_dtls_connection_state.getValue() != DtlsConnectionState::CONNECTED)) {
+    BOOST_ERROR ("DTLS state not connected");
+  }
+
+  releaseWebRtc (webRtcEpOfferer);
+  releaseWebRtc (webRtcEpAnswerer);
+}
+
+static void 
+dtls_connection_state_changes_ipv4 ()
+{
+  dtls_connection_state_changes (false);
+}
+
+static void 
+dtls_connection_state_changes_ipv6 ()
+{
+  dtls_connection_state_changes (true);
 }
 
 static void
@@ -243,7 +326,7 @@ ice_state_changes_ipv6 ()
 // https://github.com/naevatec/kms-elements/tree/dtls-connection-state
 //
 // That feature will be PR'd when KMS reaches at least GStreamer 1.17
-/******************************************************
+/******************************************************/
 static  void
 dtls_quick_connection_dtls_client_test (bool useIpv6)
 {
@@ -266,11 +349,11 @@ dtls_quick_connection_dtls_client_test (bool useIpv6)
   webRtcEpOfferer->setName ("offerer");
   webRtcEpAnswerer->setName ("answerer");
 
-  webRtcEpOfferer->signalOnIceCandidate.connect ([&] (OnIceCandidate event) {
+  webRtcEpOfferer->signalIceCandidateFound.connect ([&] (IceCandidateFound event) {
     exchange_candidate (event, webRtcEpAnswerer, useIpv6);
   });
 
-  webRtcEpAnswerer->signalOnIceCandidate.connect ([&] (OnIceCandidate event) {
+  webRtcEpAnswerer->signalIceCandidateFound.connect ([&] (IceCandidateFound event) {
     exchange_candidate (event, webRtcEpOfferer, useIpv6);
   });
 
@@ -345,11 +428,11 @@ dtls_quick_connection_dtls_client_test (bool useIpv6)
 }
 
 static void
-send_pending_candidates (std::shared_ptr <WebRtcEndpointImpl> endpoint, std::list<kurento::OnIceCandidate> candidates, bool useIpv6)
+send_pending_candidates (std::shared_ptr <WebRtcEndpointImpl> endpoint, std::list<kurento::IceCandidateFound> candidates, bool useIpv6)
 {
   GST_WARNING ("Pushing queued candidate");
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  std::for_each (candidates.begin(), candidates.end(), [endpoint, useIpv6](const OnIceCandidate event) {exchange_candidate (event, endpoint, useIpv6); });
+  std::for_each (candidates.begin(), candidates.end(), [endpoint, useIpv6](const IceCandidateFound event) {exchange_candidate (event, endpoint, useIpv6); });
 }
 
 static  void
@@ -367,7 +450,7 @@ dtls_quick_connection_dtls_server_test (bool useIpv6)
   uint64_t dtls_connection_connecting_answerer = 0;
   uint64_t dtls_connection_connected_offerer = 0;
   uint64_t dtls_connection_connected_answerer = 0;
-  std::list<kurento::OnIceCandidate> answerer_candidates = {};
+  std::list<kurento::IceCandidateFound> answerer_candidates = {};
   std::shared_ptr<std::thread> async_deliver = NULL;
 
   std::shared_ptr <WebRtcEndpointImpl> webRtcEpOfferer = createWebrtc();
@@ -376,11 +459,11 @@ dtls_quick_connection_dtls_server_test (bool useIpv6)
   webRtcEpOfferer->setName ("offerer");
   webRtcEpAnswerer->setName ("answerer");
 
-  webRtcEpOfferer->signalOnIceCandidate.connect ([&] (OnIceCandidate event) {
+  webRtcEpOfferer->signalIceCandidateFound.connect ([&] (IceCandidateFound event) {
     exchange_candidate (event, webRtcEpAnswerer, useIpv6);
   });
 
-  webRtcEpAnswerer->signalOnIceCandidate.connect ([&] (OnIceCandidate event) {
+  webRtcEpAnswerer->signalIceCandidateFound.connect ([&] (IceCandidateFound event) {
     exchange_candidate (event, webRtcEpOfferer, useIpv6);
     //answerer_candidates.push_back (event);
   });
@@ -393,12 +476,12 @@ dtls_quick_connection_dtls_server_test (bool useIpv6)
 
 
 
-  webRtcEpAnswerer->signalIceComponentStateChange.connect ([&] (IceComponentStateChange event) {
+  webRtcEpAnswerer->signalIceComponentStateChanged.connect ([&] (IceComponentStateChanged event) {
     std::shared_ptr<IceComponentState> state = event.getState ();
 
     GST_WARNING ("Answerer ICE connection state change to %s", state->getString().c_str());
   });
-  webRtcEpOfferer->signalIceComponentStateChange.connect ([&] (IceComponentStateChange event) {
+  webRtcEpOfferer->signalIceComponentStateChanged.connect ([&] (IceComponentStateChanged event) {
     std::shared_ptr<IceComponentState> state = event.getState ();
 
     GST_WARNING ("Offerer ICE connection state change to %s", state->getString().c_str());
@@ -504,7 +587,7 @@ dtls_quick_connection_dtls_server_test_ipv4 ()
 }
 
 
-******************************/
+/******************************/
 
 static  void
 stun_turn_properties ()
@@ -988,10 +1071,12 @@ init_unit_test_suite ( int , char *[] )
   test->add (BOOST_TEST_CASE ( &media_state_changes_ipv6 ), 0, /* timeout */ 15);
 
   /* These tests depend on GStreamer 1.17+ and feature on https://github.com/naevatec/kms-elements/tree/dtls-connection-state*/
-  //test->add (BOOST_TEST_CASE (&dtls_quick_connection_dtls_client_test_ipv4), 0, /* timeout */ 15);
-  //test->add (BOOST_TEST_CASE (&dtls_quick_connection_dtls_client_test_ipv6), 0, /* timeout */ 15);
-  //test->add (BOOST_TEST_CASE (&dtls_quick_connection_dtls_server_test_ipv4), 0, /* timeout */ 15);
-  //test->add (BOOST_TEST_CASE (&dtls_quick_connection_dtls_server_test_ipv6), 0, /* timeout */ 15);
+  test->add (BOOST_TEST_CASE (&dtls_quick_connection_dtls_client_test_ipv4), 0, /* timeout */ 15);
+  test->add (BOOST_TEST_CASE (&dtls_quick_connection_dtls_client_test_ipv6), 0, /* timeout */ 15);
+  test->add (BOOST_TEST_CASE (&dtls_quick_connection_dtls_server_test_ipv4), 0, /* timeout */ 15);
+  test->add (BOOST_TEST_CASE (&dtls_quick_connection_dtls_server_test_ipv6), 0, /* timeout */ 15);
+  test->add (BOOST_TEST_CASE ( &dtls_connection_state_changes_ipv4 ), 0, /* timeout */ 15);
+  test->add (BOOST_TEST_CASE ( &dtls_connection_state_changes_ipv6 ), 0, /* timeout */ 15);
 
   test->add (BOOST_TEST_CASE ( &connection_state_changes_ipv4 ),
              0, /* timeout */ 15);

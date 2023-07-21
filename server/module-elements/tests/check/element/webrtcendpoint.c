@@ -1744,7 +1744,7 @@ test_data_channels (gboolean bundle)
 
   GST_WARNING ("Finishing test");
 
-  g_usleep (500000);
+  g_usleep (1000000);
   gst_element_set_state (pipeline, GST_STATE_NULL);
   gst_bus_remove_signal_watch (bus);
   g_object_unref (bus);
